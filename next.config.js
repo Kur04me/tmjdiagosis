@@ -1,8 +1,4 @@
 /** @type {import('next').NextConfig} */
-const nextConfig = {
-  experimental: {
-    wasm: true,
-  },
-};
+const nextConfig = {};
 
 module.exports = nextConfig;

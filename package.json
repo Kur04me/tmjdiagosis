@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "wasm:build": "wasm-pack build --target web --out-dir public/wasm --out-name tmj_core"
+    "wasm:build": "wasm-pack build --target web --out-dir wasm/pkg --out-name tmj_core"
   },
   "dependencies": {
     "next": "16.0.0",

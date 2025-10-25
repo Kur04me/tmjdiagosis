@@ -2,14 +2,11 @@
 
 import { useCallback, useMemo, useRef, useState } from "react";
 
+type WasmModule = typeof import("../wasm/pkg/tmj_core.js");
+
 type Point = {
   x: number;
   y: number;
-};
-
-type WasmBindings = {
-  default?: () => Promise<unknown>;
-  greet_wasm?: () => string;
 };
 
 const clampScale = (value: number) => Math.min(Math.max(value, 0.5), 5);
@@ -31,12 +28,11 @@ export default function Home() {
 
   const loadWasm = useCallback(async () => {
     try {
-      const module = (await import(
-        /* webpackIgnore: true */ "/wasm/tmj_core.js"
-      )) as WasmBindings;
+      const module = (await import("../wasm/pkg/tmj_core.js")) as WasmModule;
+      const init = module.default;
 
-      if (typeof module.default === "function") {
-        await module.default();
+      if (typeof init === "function") {
+        await init();
       }
 
       if (typeof module.greet_wasm === "function") {
