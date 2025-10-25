@@ -1,0 +1,15 @@
+{
+  "name": "tmj_diagnosis",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "tmj_core_bg.wasm",
+    "tmj_core.js",
+    "tmj_core.d.ts"
+  ],
+  "main": "tmj_core.js",
+  "types": "tmj_core.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
