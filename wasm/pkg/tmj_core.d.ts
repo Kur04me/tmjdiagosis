@@ -1,13 +1,36 @@
 /* tslint:disable */
 /* eslint-disable */
 export function greet_wasm(): string;
+export function detect_roi(data: Uint8Array, width: number, height: number): string;
 export function process_image_for_tmj(data: Uint8Array, width: number, height: number, side: string): string;
+/**
+ * Chroma subsampling format
+ */
+export enum ChromaSampling {
+  /**
+   * Both vertically and horizontally subsampled.
+   */
+  Cs420 = 0,
+  /**
+   * Horizontally subsampled.
+   */
+  Cs422 = 1,
+  /**
+   * Not subsampled.
+   */
+  Cs444 = 2,
+  /**
+   * Monochrome.
+   */
+  Cs400 = 3,
+}
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
   readonly memory: WebAssembly.Memory;
   readonly greet_wasm: () => [number, number];
+  readonly detect_roi: (a: number, b: number, c: number, d: number) => [number, number];
   readonly process_image_for_tmj: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number];
   readonly __wbindgen_export_0: WebAssembly.Table;
   readonly __wbindgen_free: (a: number, b: number, c: number) => void;

@@ -7,6 +7,8 @@ import {
   Image as KonvaImage,
   Layer,
   Line,
+  Rect,
+  Text,
   Stage,
 } from 'react-konva';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -31,6 +33,17 @@ type RegionStyle = {
   label: string;
 };
 
+type CalibrationOverlay = {
+  active: boolean;
+  points: Array<[number, number]>;
+};
+
+type FitViewRequest = {
+  scale: number;
+  position: { x: number; y: number };
+  token: number;
+};
+
 type VectorStageProps = {
   side: Side;
   image: HTMLImageElement | null;
@@ -39,6 +52,8 @@ type VectorStageProps = {
   selection: AnchorSelection | null;
   inputState: ModifierState;
   regionStyles: Record<VectorRegion, RegionStyle>;
+  calibration: CalibrationOverlay;
+  fitViewRequest?: FitViewRequest | null;
   onSelectAnchor: (region: VectorRegion, index: number) => void;
   onAnchorDrag: (
     region: VectorRegion,
@@ -50,10 +65,13 @@ type VectorStageProps = {
     region: VectorRegion,
     point: { x: number; y: number }
   ) => void;
+  onCalibrationPoint: (point: { x: number; y: number }) => void;
   onBackgroundClick: () => void;
 };
 
 const clampScale = (value: number) => Math.min(Math.max(value, 0.5), 5);
+const clampValue = (value: number, min: number, max: number) =>
+  Math.min(Math.max(value, min), max);
 
 export default function VectorStage({
   side,
@@ -63,9 +81,12 @@ export default function VectorStage({
   selection,
   inputState,
   regionStyles,
+  calibration,
+  fitViewRequest,
   onSelectAnchor,
   onAnchorDrag,
   onRequestAddAnchor,
+  onCalibrationPoint,
   onBackgroundClick,
 }: VectorStageProps) {
   const stageRef = useRef<Konva.Stage>(null);
@@ -73,6 +94,7 @@ export default function VectorStage({
   const [stagePosition, setStagePosition] = useState<{ x: number; y: number }>(
     { x: 0, y: 0 }
   );
+  const [pointer, setPointer] = useState<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
     setStageScale(1);
@@ -84,8 +106,12 @@ export default function VectorStage({
     if (!container) {
       return;
     }
+    if (calibration.active) {
+      container.style.cursor = 'crosshair';
+      return;
+    }
     container.style.cursor = inputState.space ? 'grab' : 'default';
-  }, [inputState.space]);
+  }, [calibration.active, inputState.space]);
 
   const updateCursor = useCallback((cursor: string) => {
     const container = stageRef.current?.container();
@@ -93,6 +119,31 @@ export default function VectorStage({
       container.style.cursor = cursor;
     }
   }, []);
+
+  useEffect(() => {
+    if (!calibration.active) {
+      setPointer(null);
+    }
+  }, [calibration.active]);
+
+  useEffect(() => {
+    if (!fitViewRequest) {
+      return;
+    }
+    const stage = stageRef.current;
+    setStageScale(fitViewRequest.scale);
+    setStagePosition(fitViewRequest.position);
+    if (stage) {
+      stage.to({
+        duration: 0.45,
+        easing: Konva.Easings.EaseInOut,
+        scaleX: fitViewRequest.scale,
+        scaleY: fitViewRequest.scale,
+        x: fitViewRequest.position.x,
+        y: fitViewRequest.position.y,
+      });
+    }
+  }, [fitViewRequest?.token]);
 
   const distanceToSegmentSquared = useCallback(
     (
@@ -182,6 +233,9 @@ export default function VectorStage({
 
   const handleStageWheel = useCallback(
     (event: Konva.KonvaEventObject<WheelEvent>) => {
+      if (calibration.active) {
+        return;
+      }
       const stage = stageRef.current;
       if (!stage) {
         return;
@@ -223,6 +277,9 @@ export default function VectorStage({
   );
 
   const handleStageDragEnd = useCallback(() => {
+    if (calibration.active) {
+      return;
+    }
     const stage = stageRef.current;
     if (!stage) {
       return;
@@ -232,13 +289,28 @@ export default function VectorStage({
   }, [inputState.space, updateCursor]);
 
   const handleStageDragStart = useCallback(() => {
+    if (calibration.active || !inputState.space) {
+      const stage = stageRef.current;
+      if (stage) {
+        stage.stopDrag();
+      }
+      return;
+    }
     updateCursor('grabbing');
-  }, [updateCursor]);
+  }, [calibration.active, inputState.space, updateCursor]);
 
   const handleStageClick = useCallback(
     (event: Konva.KonvaEventObject<MouseEvent>) => {
       const stage = stageRef.current;
       if (!stage) {
+        return;
+      }
+
+      if (calibration.active) {
+        const pointer = stage.getRelativePointerPosition();
+        if (pointer) {
+          onCalibrationPoint({ x: pointer.x, y: pointer.y });
+        }
         return;
       }
 
@@ -268,6 +340,7 @@ export default function VectorStage({
 
   return (
     <div
+      className="vector-stage-container"
       style={{
         position: 'relative',
         overflow: 'auto',
@@ -322,15 +395,44 @@ export default function VectorStage({
         ref={stageRef}
         width={dimensions.width}
         height={dimensions.height}
-        draggable={inputState.space}
+        draggable
         scaleX={stageScale}
         scaleY={stageScale}
         x={stagePosition.x}
         y={stagePosition.y}
+        dragBoundFunc={(pos) => {
+          if (!inputState.space || calibration.active) {
+            const stage = stageRef.current;
+            return stage ? stage.position() : stagePosition;
+          }
+          return pos;
+        }}
         onWheel={handleStageWheel}
         onDragEnd={handleStageDragEnd}
         onDragStart={handleStageDragStart}
         onClick={handleStageClick}
+        onMouseMove={() => {
+          if (!calibration.active) {
+            return;
+          }
+          const stage = stageRef.current;
+          if (!stage || !dimensions) {
+            return;
+          }
+          const pos = stage.getRelativePointerPosition();
+          if (!pos) {
+            return;
+          }
+          setPointer({
+            x: clampValue(pos.x, 0, dimensions.width),
+            y: clampValue(pos.y, 0, dimensions.height),
+          });
+        }}
+        onMouseLeave={() => {
+          if (calibration.active) {
+            setPointer(null);
+          }
+        }}
         style={{ backgroundColor: '#111' }}
       >
         <Layer listening>
@@ -343,6 +445,142 @@ export default function VectorStage({
               height={dimensions.height}
               opacity={0.9}
             />
+          )}
+
+          {calibration.points.length > 0 && (
+            <Group listening={false}>
+              <Circle
+                x={calibration.points[0][0]}
+                y={calibration.points[0][1]}
+                radius={6}
+                fill="#fbd38d"
+                stroke="#1a202c"
+                strokeWidth={2}
+              />
+              {calibration.points.length === 2 && (
+                <>
+                  <Circle
+                    x={calibration.points[1][0]}
+                    y={calibration.points[1][1]}
+                    radius={6}
+                    fill="#fbd38d"
+                    stroke="#1a202c"
+                    strokeWidth={2}
+                  />
+                  <Line
+                    points={[
+                      calibration.points[0][0],
+                      calibration.points[0][1],
+                      calibration.points[1][0],
+                      calibration.points[1][1],
+                    ]}
+                    stroke="#fbd38d"
+                    strokeWidth={3}
+                    lineCap="round"
+                    dash={[10, 6]}
+                  />
+                </>
+              )}
+            </Group>
+          )}
+
+          {calibration.active && pointer && image && (
+            <Group listening={false} x={12} y={12}>
+              {(() => {
+                const magnifierSize = 120;
+                const padding = 10;
+                const cropSize = Math.min(
+                  60,
+                  Math.max(20, Math.min(dimensions.width, dimensions.height) / 4)
+                );
+                const effectiveCrop = cropSize / stageScale;
+                const cropX = clampValue(
+                  pointer.x - effectiveCrop / 2,
+                  0,
+                  Math.max(0, dimensions.width - effectiveCrop)
+                );
+                const cropY = clampValue(
+                  pointer.y - effectiveCrop / 2,
+                  0,
+                  Math.max(0, dimensions.height - effectiveCrop)
+                );
+                const scaleFactor = magnifierSize / effectiveCrop;
+                const crosshairX = clampValue(
+                  (pointer.x - cropX) * scaleFactor,
+                  0,
+                  magnifierSize
+                );
+                const crosshairY = clampValue(
+                  (pointer.y - cropY) * scaleFactor,
+                  0,
+                  magnifierSize
+                );
+
+                return (
+                  <>
+                    <Rect
+                      width={magnifierSize + padding * 2}
+                      height={magnifierSize + padding * 2 + 20}
+                      cornerRadius={8}
+                      fill="rgba(17, 24, 39, 0.9)"
+                      stroke="#fbd38d"
+                      strokeWidth={1}
+                    />
+                    <Group
+                      x={padding}
+                      y={padding}
+                      clip={{
+                        x: 0,
+                        y: 0,
+                        width: magnifierSize,
+                        height: magnifierSize,
+                      }}
+                    >
+                      <Rect width={magnifierSize} height={magnifierSize} fill="#0f172a" />
+                      <KonvaImage
+                        image={image}
+                        width={magnifierSize}
+                        height={magnifierSize}
+                        crop={{
+                          x: cropX,
+                          y: cropY,
+                          width: effectiveCrop,
+                          height: effectiveCrop,
+                        }}
+                      />
+                      <Line
+                        points={[crosshairX, 0, crosshairX, magnifierSize]}
+                        stroke="#fbd38d"
+                        strokeWidth={1}
+                        dash={[4, 4]}
+                      />
+                      <Line
+                        points={[0, crosshairY, magnifierSize, crosshairY]}
+                        stroke="#fbd38d"
+                        strokeWidth={1}
+                        dash={[4, 4]}
+                      />
+                    </Group>
+                    <Rect
+                      x={padding}
+                      y={padding}
+                      width={magnifierSize}
+                      height={magnifierSize}
+                      stroke="#fbd38d"
+                      strokeWidth={1}
+                      cornerRadius={4}
+                    />
+                    <Text
+                      text="拡大表示"
+                      x={padding}
+                      y={padding + magnifierSize + 6}
+                      fontSize={12}
+                      fill="#fbd38d"
+                    />
+                  </>
+                );
+              })()}
+            </Group>
           )}
 
           {vectorData &&
@@ -378,25 +616,34 @@ export default function VectorStage({
                           fill={style.anchor}
                           stroke={isSelected ? '#fbd38d' : '#1a202c'}
                           strokeWidth={isSelected ? 3 : 2}
-                          draggable={!inputState.space}
+                          draggable={!inputState.space && !calibration.active}
                           onMouseDown={(event) => {
+                            if (calibration.active) {
+                              return;
+                            }
                             event.cancelBubble = true;
-                            onSelectAnchor(region, index);
-                          }}
-                          onDragMove={(event) =>
-                            onAnchorDrag(
-                              region,
-                              index,
-                              event.target.x(),
-                              event.target.y()
-                            )
-                          }
-                          onDragEnd={(event) =>
-                            onAnchorDrag(
-                              region,
-                              index,
-                              event.target.x(),
-                              event.target.y()
+                          onSelectAnchor(region, index);
+                        }}
+                        onDragMove={(event) =>
+                          calibration.active
+                            ? undefined
+                            :
+                          onAnchorDrag(
+                            region,
+                            index,
+                            event.target.x(),
+                            event.target.y()
+                          )
+                        }
+                        onDragEnd={(event) =>
+                          calibration.active
+                            ? undefined
+                            :
+                          onAnchorDrag(
+                            region,
+                            index,
+                            event.target.x(),
+                            event.target.y()
                             )
                           }
                         />

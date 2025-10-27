@@ -53,6 +53,26 @@ function passArray8ToWasm0(arg, malloc) {
     WASM_VECTOR_LEN = arg.length;
     return ptr;
 }
+/**
+ * @param {Uint8Array} data
+ * @param {number} width
+ * @param {number} height
+ * @returns {string}
+ */
+export function detect_roi(data, width, height) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.detect_roi(ptr0, len0, width, height);
+        deferred2_0 = ret[0];
+        deferred2_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+    }
+}
 
 const cachedTextEncoder = new TextEncoder();
 
@@ -129,6 +149,29 @@ export function process_image_for_tmj(data, width, height, side) {
     }
 }
 
+/**
+ * Chroma subsampling format
+ * @enum {0 | 1 | 2 | 3}
+ */
+export const ChromaSampling = Object.freeze({
+    /**
+     * Both vertically and horizontally subsampled.
+     */
+    Cs420: 0, "0": "Cs420",
+    /**
+     * Horizontally subsampled.
+     */
+    Cs422: 1, "1": "Cs422",
+    /**
+     * Not subsampled.
+     */
+    Cs444: 2, "2": "Cs444",
+    /**
+     * Monochrome.
+     */
+    Cs400: 3, "3": "Cs400",
+});
+
 const EXPECTED_RESPONSE_TYPES = new Set(['basic', 'cors', 'default']);
 
 async function __wbg_load(module, imports) {
@@ -167,6 +210,9 @@ async function __wbg_load(module, imports) {
 function __wbg_get_imports() {
     const imports = {};
     imports.wbg = {};
+    imports.wbg.__wbg_wbindgenthrow_451ec1a8469d7eb6 = function(arg0, arg1) {
+        throw new Error(getStringFromWasm0(arg0, arg1));
+    };
     imports.wbg.__wbindgen_init_externref_table = function() {
         const table = wasm.__wbindgen_export_0;
         const offset = table.grow(4);

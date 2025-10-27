@@ -55,6 +55,26 @@ const STATUS_LABELS = {
   error: 'エラー',
 } as const;
 
+type RoiBounds = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type FitViewRequest = {
+  scale: number;
+  position: { x: number; y: number };
+  token: number;
+};
+
+type CalibrationState = {
+  active: boolean;
+  points: Array<[number, number]>;
+  pendingPixels: number | null;
+  inputValue: string;
+};
+
 type SideState = {
   imageSrc: string | null;
   imageNode: HTMLImageElement | null;
@@ -64,6 +84,9 @@ type SideState = {
   finalVectors: string | null;
   status: 'idle' | 'ready' | 'processing' | 'done' | 'error';
   statusMessage: string;
+  mmPerPixel: number | null;
+  calibration: CalibrationState;
+  fitViewRequest: FitViewRequest | null;
 };
 
 const createInitialSideState = (): SideState => ({
@@ -75,7 +98,45 @@ const createInitialSideState = (): SideState => ({
   finalVectors: null,
   status: 'idle',
   statusMessage: '画像を読み込んでください。',
+  mmPerPixel: null,
+  calibration: { active: false, points: [], pendingPixels: null, inputValue: '' },
+  fitViewRequest: null,
 });
+
+const computeFitView = (
+  dimensions: { width: number; height: number },
+  roi: RoiBounds
+): { scale: number; position: { x: number; y: number } } | null => {
+  if (
+    roi.width == 0 ||
+    roi.height == 0 ||
+    dimensions.width === 0 ||
+    dimensions.height === 0
+  ) {
+    return null;
+  }
+
+  const desiredCoverage = 0.8;
+  const scaleX = (dimensions.width * desiredCoverage) / roi.width;
+  const scaleY = (dimensions.height * desiredCoverage) / roi.height;
+  let scale = Math.min(scaleX, scaleY);
+  if (!Number.isFinite(scale) || scale <= 0) {
+    scale = 1;
+  } else if (scale < 1) {
+    scale = 1;
+  }
+
+  const centerX = (roi.x as number) + (roi.width as number) / 2;
+  const centerY = (roi.y as number) + (roi.height as number) / 2;
+
+  return {
+    scale,
+    position: {
+      x: dimensions.width / 2 - centerX * scale,
+      y: dimensions.height / 2 - centerY * scale,
+    },
+  };
+};
 
 const clamp = (value: number, min: number, max: number) =>
   Math.min(Math.max(value, min), max);
@@ -261,30 +322,169 @@ export default function Home() {
     []
   );
 
+  const handleAutoExtract = useCallback(
+    async (side: Side, options?: { reason?: 'auto' | 'manual' }) => {
+      const reason = options?.reason ?? 'manual';
+      const state = sideStates[side];
+      if (!state.imageNode || !state.dimensions) {
+        updateSideState(side, (prev) => ({
+          ...prev,
+          statusMessage: '先に画像を読み込んでください。',
+        }));
+        return;
+      }
+
+      updateSideState(side, (prev) => ({
+        ...prev,
+        status: 'processing',
+        statusMessage:
+          reason === 'auto'
+            ? 'ROI に基づき自動抽出を実行しています...'
+            : '自動抽出を実行しています...',
+      }));
+      setActiveSelection(null);
+
+      try {
+        const module = await loadWasm();
+        const { width, height } = state.dimensions;
+        const grayscale = extractGrayscale(state.imageNode, width, height);
+        const raw = module.process_image_for_tmj(grayscale, width, height, side);
+        const parsed = JSON.parse(raw) as {
+          condyle?: Array<[number, number]>;
+          fossa?: Array<[number, number]>;
+        };
+        const normalized: VectorShape = {
+          condyle: parsed.condyle ?? [],
+          fossa: parsed.fossa ?? [],
+        };
+        const constrained = ensureMaxPoints(normalized, MAX_POINTS);
+
+        updateSideState(side, (prev) => ({
+          ...prev,
+          vectorData: constrained,
+          vectorJson: buildVectorJson(side, constrained),
+          finalVectors: null,
+          status: 'done',
+          statusMessage:
+            reason === 'auto'
+              ? '自動抽出完了。必要に応じて調整してください。'
+              : '自動抽出完了。必要に応じて調整してください。',
+        }));
+      } catch (error) {
+        console.error('Segmentation failed', error);
+        updateSideState(side, (prev) => ({
+          ...prev,
+          status: 'error',
+          statusMessage:
+            'セグメンテーション処理に失敗しました。適切な画像かご確認ください。',
+        }));
+      }
+    },
+    [extractGrayscale, loadWasm, sideStates, updateSideState]
+  );
+
   const handleImageLoaded = useCallback(
     async (side: Side, dataUrl: string) => {
       const img = new Image();
       img.onload = async () => {
         setActiveSelection(null);
+        const dimensions = {
+          width: img.naturalWidth || DEFAULT_STAGE_SIZE.width,
+          height: img.naturalHeight || DEFAULT_STAGE_SIZE.height,
+        };
         updateSideState(side, (prev) => ({
           ...prev,
           imageSrc: dataUrl,
           imageNode: img,
-          dimensions: {
-            width: img.naturalWidth || DEFAULT_STAGE_SIZE.width,
-            height: img.naturalHeight || DEFAULT_STAGE_SIZE.height,
-          },
+          dimensions,
           vectorData: null,
           vectorJson: null,
           finalVectors: null,
+          mmPerPixel: null,
+          calibration: {
+            active: false,
+            points: [],
+            pendingPixels: null,
+            inputValue: '',
+          },
+          fitViewRequest: {
+            scale: 1,
+            position: { x: 0, y: 0 },
+            token: Date.now(),
+          },
           status: 'ready',
-          statusMessage: '画像読み込み済み。自動抽出を実行してください。',
+          statusMessage: '画像読み込み済み。処理を準備しています...',
         }));
 
         try {
           const module = await loadWasm();
           const message = module.greet_wasm?.();
           setWasmMessage(message ?? 'Wasm module returned no message.');
+
+          const grayscale = extractGrayscale(
+            img,
+            dimensions.width,
+            dimensions.height
+          );
+
+          let roi: RoiBounds | null = null;
+          if (typeof module.detect_roi === 'function') {
+            try {
+              const raw = module.detect_roi(
+                grayscale,
+                dimensions.width,
+                dimensions.height
+              );
+              const parsed = JSON.parse(raw) as Partial<RoiBounds>;
+              if (
+                typeof parsed.x === 'number' &&
+                typeof parsed.y === 'number' &&
+                typeof parsed.width === 'number' &&
+                typeof parsed.height === 'number' &&
+                parsed.width > 0 &&
+                parsed.height > 0
+              ) {
+                roi = {
+                  x: parsed.x,
+                  y: parsed.y,
+                  width: parsed.width,
+                  height: parsed.height,
+                };
+              }
+            } catch (error) {
+              console.warn('Failed to parse ROI result', error);
+            }
+          }
+
+          if (roi) {
+            const fit = computeFitView(dimensions, roi);
+            if (fit) {
+              const token = Date.now();
+              updateSideState(side, (prev) => ({
+                ...prev,
+                fitViewRequest: {
+                  scale: fit.scale,
+                  position: fit.position,
+                  token,
+                },
+                statusMessage: 'ROIを検出しました。ビューを調整しています...',
+              }));
+              window.setTimeout(() => {
+                void handleAutoExtract(side, { reason: 'auto' });
+              }, 500);
+            } else {
+              updateSideState(side, (prev) => ({
+                ...prev,
+                statusMessage: '画像読み込み済み。自動抽出を実行してください。',
+              }));
+            }
+          } else {
+            updateSideState(side, (prev) => ({
+              ...prev,
+              statusMessage:
+                '画像読み込み済み。自動抽出を実行してください。',
+            }));
+          }
         } catch (error) {
           console.error('Failed to initialize Wasm module.', error);
           setWasmMessage(
@@ -301,7 +501,7 @@ export default function Home() {
       };
       img.src = dataUrl;
     },
-    [loadWasm, updateSideState]
+    [extractGrayscale, handleAutoExtract, loadWasm, updateSideState]
   );
 
   const handleFileChange = useCallback(
@@ -369,58 +569,151 @@ export default function Home() {
     [handleImageLoaded, updateSideState]
   );
 
-  const handleAutoExtract = useCallback(
-    async (side: Side) => {
-      const state = sideStates[side];
-      if (!state.imageNode || !state.dimensions) {
-        updateSideState(side, (prev) => ({
-          ...prev,
-          statusMessage: '先に画像を読み込んでください。',
-        }));
-        return;
-      }
-
+  const handleStartCalibration = useCallback(
+    (side: Side) => {
+      setActiveSelection(null);
       updateSideState(side, (prev) => ({
         ...prev,
-        status: 'processing',
-        statusMessage: '自動抽出を実行しています...',
+        calibration: {
+          active: true,
+          points: [],
+          pendingPixels: null,
+          inputValue: '',
+        },
+        statusMessage: '基準線の始点をクリックしてください。',
       }));
-      setActiveSelection(null);
-
-      try {
-        const module = await loadWasm();
-        const { width, height } = state.dimensions;
-        const grayscale = extractGrayscale(state.imageNode, width, height);
-        const raw = module.process_image_for_tmj(grayscale, width, height, side);
-        const parsed = JSON.parse(raw) as {
-          condyle?: Array<[number, number]>;
-          fossa?: Array<[number, number]>;
-        };
-        const normalized: VectorShape = {
-          condyle: parsed.condyle ?? [],
-          fossa: parsed.fossa ?? [],
-        };
-        const constrained = ensureMaxPoints(normalized, MAX_POINTS);
-
-        updateSideState(side, (prev) => ({
-          ...prev,
-          vectorData: constrained,
-          vectorJson: buildVectorJson(side, constrained),
-          finalVectors: null,
-          status: 'done',
-          statusMessage: '自動抽出完了。アンカーポイントを調整してください。',
-        }));
-      } catch (error) {
-        console.error('Segmentation failed', error);
-        updateSideState(side, (prev) => ({
-          ...prev,
-          status: 'error',
-          statusMessage:
-            'セグメンテーション処理に失敗しました。適切な画像かご確認ください。',
-        }));
-      }
     },
-    [extractGrayscale, loadWasm, sideStates, updateSideState]
+    [updateSideState]
+  );
+
+  const handleCalibrationPoint = useCallback(
+    (side: Side, point: { x: number; y: number }) => {
+      updateSideState(side, (prev) => {
+        if (!prev.calibration.active) {
+          return prev;
+        }
+        if (prev.calibration.pendingPixels !== null) {
+          return prev;
+        }
+
+        const nextPoints = [
+          ...prev.calibration.points,
+          [point.x, point.y] as [number, number],
+        ];
+
+        if (nextPoints.length < 2) {
+          return {
+            ...prev,
+            calibration: {
+              active: true,
+              points: nextPoints,
+              pendingPixels: null,
+              inputValue: '',
+            },
+            statusMessage: '基準線の終点をクリックしてください。',
+          };
+        }
+
+        const dx = nextPoints[1][0] - nextPoints[0][0];
+        const dy = nextPoints[1][1] - nextPoints[0][1];
+        const pixelDistance = Math.hypot(dx, dy);
+
+        if (!Number.isFinite(pixelDistance) || pixelDistance < 1) {
+          return {
+            ...prev,
+            calibration: {
+              active: true,
+              points: [],
+              pendingPixels: null,
+              inputValue: '',
+            },
+            statusMessage:
+              '基準線の距離が短すぎます。再度選択してください。',
+          };
+        }
+
+        const defaultMm =
+          prev.mmPerPixel && prev.mmPerPixel > 0
+            ? (prev.mmPerPixel * pixelDistance).toFixed(2)
+            : '10';
+
+        return {
+          ...prev,
+          calibration: {
+            active: false,
+            points: nextPoints,
+            pendingPixels: pixelDistance,
+            inputValue: defaultMm,
+          },
+          statusMessage: '距離を確認し、スケールを確定してください。',
+        };
+      });
+    },
+    [updateSideState]
+  );
+
+  const handleCalibrationInputChange = useCallback(
+    (side: Side, value: string) => {
+      updateSideState(side, (prev) => {
+        if (prev.calibration.pendingPixels === null) {
+          return prev;
+        }
+        return {
+          ...prev,
+          calibration: {
+            ...prev.calibration,
+            inputValue: value,
+          },
+        };
+      });
+    },
+    [updateSideState]
+  );
+
+  const handleCancelCalibration = useCallback(
+    (side: Side, message?: string) => {
+      updateSideState(side, (prev) => {
+        if (
+          !prev.calibration.active &&
+          prev.calibration.pendingPixels === null &&
+          prev.calibration.points.length === 0
+        ) {
+          return prev;
+        }
+        return {
+          ...prev,
+          calibration: { active: false, points: [], pendingPixels: null, inputValue: '' },
+          statusMessage: message ?? 'スケール校正をキャンセルしました。',
+        };
+      });
+    },
+    [updateSideState]
+  );
+
+  const handleConfirmCalibration = useCallback(
+    (side: Side) => {
+      updateSideState(side, (prev) => {
+        const pixels = prev.calibration.pendingPixels;
+        if (pixels === null) {
+          return prev;
+        }
+        const mmValue = Number.parseFloat(prev.calibration.inputValue);
+        if (!Number.isFinite(mmValue) || mmValue <= 0) {
+          return {
+            ...prev,
+            statusMessage: '有効な距離を入力してください。',
+          };
+        }
+        const mmPerPixel = mmValue / pixels;
+        return {
+          ...prev,
+          mmPerPixel,
+          calibration: { active: false, points: [], pendingPixels: null, inputValue: '' },
+          statusMessage: `スケールを設定しました: ${mmPerPixel.toFixed(3)} mm/px`,
+        };
+      });
+    },
+    [updateSideState]
   );
 
   const handleAnchorDrag = useCallback(
@@ -456,6 +749,12 @@ export default function Home() {
   const handleAddAnchor = useCallback(
     (side: Side, region: VectorRegion, point: { x: number; y: number }) => {
       const state = sideStates[side];
+      if (
+        state.calibration.active ||
+        state.calibration.pendingPixels !== null
+      ) {
+        return;
+      }
       const limit = state.dimensions ?? DEFAULT_STAGE_SIZE;
       const candidate: [number, number] = [
         clamp(point.x, 0, limit.width),
@@ -598,6 +897,8 @@ export default function Home() {
       'ズーム: Ctrl (または ⌘) + ホイール',
       'アンカー移動: 左クリックでドラッグ',
       'アンカー追加: Shift + 左クリック（カーソル付近のアウトラインへ追加）',
+      'スケール校正: ボタン押下後に 2 点クリックし距離 (mm) を入力',
+      'スケール校正キャンセル: ESC またはキャンバス外クリック',
       'アンカー削除: Delete または Backspace（選択中のアンカー）',
     ],
     []
@@ -648,6 +949,14 @@ export default function Home() {
             void handleRemoveSelectedAnchor();
           }
           break;
+        case 'Escape':
+          for (const side of SIDES) {
+            const cal = sideStates[side].calibration;
+            if (cal.active || cal.pendingPixels !== null) {
+              handleCancelCalibration(side);
+            }
+          }
+          break;
         default:
           break;
       }
@@ -682,7 +991,7 @@ export default function Home() {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
-  }, [handleRemoveSelectedAnchor]);
+  }, [handleCancelCalibration, handleRemoveSelectedAnchor, sideStates]);
 
   return (
     <main
@@ -747,6 +1056,18 @@ export default function Home() {
           return (
             <article
               key={side}
+              onMouseDownCapture={(event) => {
+                if (
+                  (state.calibration.active ||
+                    state.calibration.pendingPixels !== null) &&
+                  !(event.target as HTMLElement).closest(
+                    '.vector-stage-container'
+                  ) &&
+                  !(event.target as HTMLElement).closest('.calibration-panel')
+                ) {
+                  handleCancelCalibration(side);
+                }
+              }}
               style={{
                 backgroundColor: '#0c0c0c',
                 borderRadius: '0.75rem',
@@ -779,6 +1100,11 @@ export default function Home() {
                   {STATUS_LABELS[state.status]}: {state.statusMessage}
                 </span>
               </div>
+              {typeof state.mmPerPixel === 'number' && (
+                <div style={{ fontSize: '0.85rem', color: '#a0aec0' }}>
+                  スケール: {state.mmPerPixel.toFixed(3)} mm/px
+                </div>
+              )}
 
               <div
                 style={{
@@ -821,6 +1147,30 @@ export default function Home() {
 
                 <button
                   type="button"
+                  onClick={() => handleStartCalibration(side)}
+                  disabled={
+                    !canExtract || state.calibration.active || isProcessing
+                  }
+                  style={{
+                    padding: '0.5rem 0.9rem',
+                    borderRadius: '0.5rem',
+                    border: '1px solid #2d3748',
+                    backgroundColor: state.calibration.active
+                      ? '#744210'
+                      : '#b7791f',
+                    color: '#1a202c',
+                    fontWeight: 600,
+                    cursor:
+                      !canExtract || state.calibration.active || isProcessing
+                        ? 'not-allowed'
+                        : 'pointer',
+                  }}
+                >
+                  スケール校正
+                </button>
+
+                <button
+                  type="button"
                   onClick={() => void handleAutoExtract(side)}
                   disabled={!canExtract || isProcessing}
                   style={{
@@ -856,6 +1206,88 @@ export default function Home() {
                 </button>
               </div>
 
+              {state.calibration.pendingPixels !== null && (
+                <div
+                  className="calibration-panel"
+                  style={{
+                    backgroundColor: '#1a202c',
+                    borderRadius: '0.75rem',
+                    padding: '0.75rem',
+                    display: 'flex',
+                    flexWrap: 'wrap',
+                    gap: '0.75rem',
+                    alignItems: 'center',
+                  }}
+                >
+                  <span style={{ color: '#fbd38d', fontSize: '0.9rem' }}>
+                    ピクセル距離: {state.calibration.pendingPixels.toFixed(2)} px
+                  </span>
+                  <label
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '0.5rem',
+                      color: '#e2e8f0',
+                    }}
+                  >
+                    <span>実距離 (mm)</span>
+                    <input
+                      type="number"
+                      inputMode="decimal"
+                      value={state.calibration.inputValue}
+                      onChange={(event) =>
+                        handleCalibrationInputChange(side, event.target.value)
+                      }
+                      style={{
+                        width: '6rem',
+                        padding: '0.3rem 0.4rem',
+                        borderRadius: '0.4rem',
+                        border: '1px solid #2d3748',
+                        backgroundColor: '#111827',
+                        color: '#e2e8f0',
+                      }}
+                    />
+                  </label>
+                  <div
+                    style={{
+                      display: 'inline-flex',
+                      gap: '0.5rem',
+                      marginLeft: 'auto',
+                    }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => handleConfirmCalibration(side)}
+                      style={{
+                        padding: '0.45rem 0.9rem',
+                        borderRadius: '0.5rem',
+                        border: '1px solid #22543d',
+                        backgroundColor: '#38a169',
+                        color: '#f7fafc',
+                        cursor: 'pointer',
+                        fontWeight: 600,
+                      }}
+                    >
+                      スケールを確定
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleCancelCalibration(side)}
+                      style={{
+                        padding: '0.45rem 0.9rem',
+                        borderRadius: '0.5rem',
+                        border: '1px solid #742a2a',
+                        backgroundColor: '#742a2a',
+                        color: '#fef2f2',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      キャンセル
+                    </button>
+                  </div>
+                </div>
+              )}
+
               <div
                 style={{
                   backgroundColor: '#111827',
@@ -876,6 +1308,11 @@ export default function Home() {
                     selection={selection}
                     inputState={modifierState}
                     regionStyles={REGION_STYLES}
+                    calibration={state.calibration}
+                    fitViewRequest={state.fitViewRequest}
+                    onCalibrationPoint={(point) =>
+                      handleCalibrationPoint(side, point)
+                    }
                     onSelectAnchor={(region, index) =>
                       setActiveSelection({ side, region, index })
                     }
