@@ -27,12 +27,25 @@ const SAMPLE_ENDPOINT: Record<Side, string> = {
   left: '/api/sample/left',
   right: '/api/sample/right',
 };
+const REGION_LABELS: Record<VectorRegion, string> = {
+  condyle: '下顎頭',
+  fossa: '関節窩',
+};
+
 const REGION_STYLES: Record<
   VectorRegion,
-  { stroke: string; anchor: string }
+  { stroke: string; anchor: string; label: string }
 > = {
-  condyle: { stroke: '#63b3ed', anchor: '#3182ce' },
-  fossa: { stroke: '#f6ad55', anchor: '#dd6b20' },
+  condyle: {
+    stroke: '#f6ad55',
+    anchor: '#dd6b20',
+    label: REGION_LABELS.condyle,
+  },
+  fossa: {
+    stroke: '#63b3ed',
+    anchor: '#3182ce',
+    label: REGION_LABELS.fossa,
+  },
 };
 const STATUS_LABELS = {
   idle: '未処理',
@@ -51,7 +64,6 @@ type SideState = {
   finalVectors: string | null;
   status: 'idle' | 'ready' | 'processing' | 'done' | 'error';
   statusMessage: string;
-  selectedRegion: VectorRegion;
 };
 
 const createInitialSideState = (): SideState => ({
@@ -63,7 +75,6 @@ const createInitialSideState = (): SideState => ({
   finalVectors: null,
   status: 'idle',
   statusMessage: '画像を読み込んでください。',
-  selectedRegion: 'condyle',
 });
 
 const clamp = (value: number, min: number, max: number) =>
@@ -443,9 +454,8 @@ export default function Home() {
   );
 
   const handleAddAnchor = useCallback(
-    (side: Side, point: { x: number; y: number }) => {
+    (side: Side, region: VectorRegion, point: { x: number; y: number }) => {
       const state = sideStates[side];
-      const region = state.selectedRegion;
       const limit = state.dimensions ?? DEFAULT_STAGE_SIZE;
       const candidate: [number, number] = [
         clamp(point.x, 0, limit.width),
@@ -482,7 +492,7 @@ export default function Home() {
           vectorData: nextVector,
           vectorJson: buildVectorJson(side, nextVector),
           finalVectors: null,
-          statusMessage: 'アンカーポイントを追加しました。',
+          statusMessage: `${REGION_LABELS[region]}にアンカーポイントを追加しました。`,
         };
       });
 
@@ -587,7 +597,7 @@ export default function Home() {
       'パン: Space + 左ドラッグ（ドラッグ中はステージが移動します）',
       'ズーム: Ctrl (または ⌘) + ホイール',
       'アンカー移動: 左クリックでドラッグ',
-      'アンカー追加: Shift + 左クリック（選択中の領域に追加）',
+      'アンカー追加: Shift + 左クリック（カーソル付近のアウトラインへ追加）',
       'アンカー削除: Delete または Backspace（選択中のアンカー）',
     ],
     []
@@ -829,42 +839,6 @@ export default function Home() {
                   {isProcessing ? '処理中...' : '自動抽出'}
                 </button>
 
-                <label
-                  style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: '0.5rem',
-                    backgroundColor: '#1a202c',
-                    border: '1px solid #2d3748',
-                    borderRadius: '0.5rem',
-                    padding: '0.35rem 0.6rem',
-                  }}
-                >
-                  <span style={{ fontSize: '0.85rem' }}>編集対象:</span>
-                  <select
-                    value={state.selectedRegion}
-                    onChange={(event) =>
-                      updateSideState(side, (prev) => ({
-                        ...prev,
-                        selectedRegion: event.target.value as VectorRegion,
-                        statusMessage: `${
-                          event.target.value === 'condyle' ? '下顎頭' : '関節窩'
-                        } を編集します。`,
-                      }))
-                    }
-                    style={{
-                      padding: '0.3rem 0.5rem',
-                      borderRadius: '0.4rem',
-                      border: '1px solid #2d3748',
-                      backgroundColor: '#111827',
-                      color: '#e2e8f0',
-                    }}
-                  >
-                    <option value="condyle">下顎頭 (condyle)</option>
-                    <option value="fossa">関節窩 (fossa)</option>
-                  </select>
-                </label>
-
                 <button
                   type="button"
                   onClick={() => handleConfirmVectors(side)}
@@ -908,7 +882,9 @@ export default function Home() {
                     onAnchorDrag={(region, index, x, y) =>
                       handleAnchorDrag(side, region, index, x, y)
                     }
-                    onRequestAddAnchor={(point) => handleAddAnchor(side, point)}
+                    onRequestAddAnchor={(region, point) =>
+                      handleAddAnchor(side, region, point)
+                    }
                     onBackgroundClick={() => setActiveSelection(null)}
                   />
                 ) : (

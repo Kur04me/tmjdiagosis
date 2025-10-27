@@ -28,6 +28,7 @@ export type ModifierState = {
 type RegionStyle = {
   stroke: string;
   anchor: string;
+  label: string;
 };
 
 type VectorStageProps = {
@@ -45,7 +46,10 @@ type VectorStageProps = {
     x: number,
     y: number
   ) => void;
-  onRequestAddAnchor: (point: { x: number; y: number }) => void;
+  onRequestAddAnchor: (
+    region: VectorRegion,
+    point: { x: number; y: number }
+  ) => void;
   onBackgroundClick: () => void;
 };
 
@@ -89,6 +93,87 @@ export default function VectorStage({
       container.style.cursor = cursor;
     }
   }, []);
+
+  const distanceToSegmentSquared = useCallback(
+    (
+      px: number,
+      py: number,
+      ax: number,
+      ay: number,
+      bx: number,
+      by: number
+    ) => {
+      const abx = bx - ax;
+      const aby = by - ay;
+      const apx = px - ax;
+      const apy = py - ay;
+      const abLenSq = abx * abx + aby * aby;
+      if (abLenSq === 0) {
+        return apx * apx + apy * apy;
+      }
+      const t = Math.min(Math.max((apx * abx + apy * aby) / abLenSq, 0), 1);
+      const closestX = ax + abx * t;
+      const closestY = ay + aby * t;
+      const dx = px - closestX;
+      const dy = py - closestY;
+      return dx * dx + dy * dy;
+    },
+    []
+  );
+
+  const measureRegionDistance = useCallback(
+    (region: VectorRegion, point: { x: number; y: number }) => {
+      const points = vectorData?.[region] ?? [];
+      if (!points.length) {
+        return Number.POSITIVE_INFINITY;
+      }
+
+      let best = Number.POSITIVE_INFINITY;
+
+      for (let i = 0; i < points.length - 1; i += 1) {
+        const [ax, ay] = points[i];
+        const [bx, by] = points[i + 1];
+        const distance = distanceToSegmentSquared(
+          point.x,
+          point.y,
+          ax,
+          ay,
+          bx,
+          by
+        );
+        if (distance < best) {
+          best = distance;
+        }
+      }
+
+      const start = points[0];
+      const end = points[points.length - 1];
+      const startDistance =
+        (point.x - start[0]) ** 2 + (point.y - start[1]) ** 2;
+      const endDistance = (point.x - end[0]) ** 2 + (point.y - end[1]) ** 2;
+      return Math.min(best, startDistance, endDistance);
+    },
+    [distanceToSegmentSquared, vectorData]
+  );
+
+  const determineRegionForPoint = useCallback(
+    (point: { x: number; y: number }): VectorRegion => {
+      const regions: VectorRegion[] = ['condyle', 'fossa'];
+      let bestRegion: VectorRegion = 'condyle';
+      let bestDistance = Number.POSITIVE_INFINITY;
+
+      for (const region of regions) {
+        const distance = measureRegionDistance(region, point);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          bestRegion = region;
+        }
+      }
+
+      return bestRegion;
+    },
+    [measureRegionDistance]
+  );
 
   const linePoints = useCallback(
     (points: Array<[number, number]>) => points.flatMap(([x, y]) => [x, y]),
@@ -162,7 +247,11 @@ export default function VectorStage({
         if (!pointer) {
           return;
         }
-        onRequestAddAnchor({ x: pointer.x, y: pointer.y });
+        const region = determineRegionForPoint({
+          x: pointer.x,
+          y: pointer.y,
+        });
+        onRequestAddAnchor(region, { x: pointer.x, y: pointer.y });
         return;
       }
 
@@ -180,6 +269,7 @@ export default function VectorStage({
   return (
     <div
       style={{
+        position: 'relative',
         overflow: 'auto',
         borderRadius: '0.5rem',
         border: '1px solid #2d3748',
@@ -187,6 +277,47 @@ export default function VectorStage({
         maxHeight: '720px',
       }}
     >
+      <div
+        style={{
+          position: 'absolute',
+          inset: '0.75rem auto auto 0.75rem',
+          display: 'flex',
+          gap: '0.75rem',
+          padding: '0.35rem 0.6rem',
+          borderRadius: '0.5rem',
+          backgroundColor: 'rgba(17, 24, 39, 0.7)',
+          color: '#e2e8f0',
+          fontSize: '0.75rem',
+          pointerEvents: 'none',
+          zIndex: 1,
+        }}
+      >
+        {(['condyle', 'fossa'] as VectorRegion[]).map((region) => {
+          const style = regionStyles[region];
+          return (
+            <span
+              key={`${side}-${region}-legend`}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.4rem',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              <span
+                style={{
+                  width: '0.75rem',
+                  height: '0.75rem',
+                  borderRadius: '999px',
+                  backgroundColor: style.stroke,
+                  boxShadow: '0 0 0 1px rgba(15, 23, 42, 0.6)',
+                }}
+              />
+              {style.label}
+            </span>
+          );
+        })}
+      </div>
       <Stage
         ref={stageRef}
         width={dimensions.width}
