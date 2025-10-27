@@ -8,28 +8,39 @@ pub fn greet_wasm() -> String {
 
 #[derive(Serialize)]
 struct SegmentationResult {
+    side: String,
     condyle: Vec<[f64; 2]>,
     fossa: Vec<[f64; 2]>,
 }
 
-fn generate_ellipse_points(cx: f64, cy: f64, rx: f64, ry: f64, segments: usize) -> Vec<[f64; 2]> {
-    let mut points = Vec::with_capacity(segments + 1);
-    for i in 0..=segments {
-        let theta = (i as f64 / segments as f64) * std::f64::consts::TAU;
-        points.push([cx + rx * theta.cos(), cy + ry * theta.sin()]);
+fn generate_open_curve(
+    cx: f64,
+    cy: f64,
+    rx: f64,
+    ry: f64,
+    start_angle: f64,
+    end_angle: f64,
+    points: usize,
+) -> Vec<[f64; 2]> {
+    let points = points.max(2);
+    let mut result = Vec::with_capacity(points);
+    let step = (end_angle - start_angle) / (points as f64 - 1.0);
+    for i in 0..points {
+        let theta = start_angle + step * i as f64;
+        result.push([cx + rx * theta.cos(), cy + ry * theta.sin()]);
     }
-    points
+    result
 }
 
 #[wasm_bindgen]
-pub fn process_image_for_tmj(data: Box<[u8]>, width: u32, height: u32) -> String {
+pub fn process_image_for_tmj(data: Box<[u8]>, width: u32, height: u32, side: &str) -> String {
     if width == 0 || height == 0 {
-        return "{\"condyle\":[],\"fossa\":[]}".to_owned();
+        return "{\"side\":\"unknown\",\"condyle\":[],\"fossa\":[]}".to_owned();
     }
 
     let expected_len = (width as usize).saturating_mul(height as usize);
     if data.len() < expected_len {
-        return "{\"condyle\":[],\"fossa\":[]}".to_owned();
+        return "{\"side\":\"unknown\",\"condyle\":[],\"fossa\":[]}".to_owned();
     }
 
     let width_f = width as f64;
@@ -56,36 +67,71 @@ pub fn process_image_for_tmj(data: Box<[u8]>, width: u32, height: u32) -> String
         }
     }
 
+    let is_left = matches!(side.to_ascii_lowercase().as_str(), "left" | "l");
+
     let condyle_center = if condyle_acc.2 > f64::EPSILON {
         (
             condyle_acc.0 / condyle_acc.2,
             condyle_acc.1 / condyle_acc.2,
         )
     } else {
-        (width_f * 0.35, height_f * 0.45)
+        if is_left {
+            (width_f * 0.35, height_f * 0.45)
+        } else {
+            (width_f * 0.4, height_f * 0.5)
+        }
     };
 
     let fossa_center = if fossa_acc.2 > f64::EPSILON {
         (fossa_acc.0 / fossa_acc.2, fossa_acc.1 / fossa_acc.2)
     } else {
-        (width_f * 0.65, height_f * 0.4)
+        if is_left {
+            (width_f * 0.6, height_f * 0.4)
+        } else {
+            (width_f * 0.65, height_f * 0.38)
+        }
     };
 
-    let condyle = generate_ellipse_points(
+    let condyle = generate_open_curve(
         condyle_center.0,
         condyle_center.1,
         width_f * 0.18,
         height_f * 0.22,
-        48,
+        if is_left {
+            std::f64::consts::PI * 0.9
+        } else {
+            std::f64::consts::PI * 0.1
+        },
+        if is_left {
+            std::f64::consts::PI * 1.7
+        } else {
+            std::f64::consts::PI * 1.5
+        },
+        10,
     );
-    let fossa = generate_ellipse_points(
+    let fossa = generate_open_curve(
         fossa_center.0,
         fossa_center.1,
-        width_f * 0.2,
+        width_f * 0.24,
         height_f * 0.18,
-        48,
+        if is_left {
+            std::f64::consts::PI * 0.25
+        } else {
+            std::f64::consts::PI * 0.8
+        },
+        if is_left {
+            std::f64::consts::PI * 1.35
+        } else {
+            std::f64::consts::PI * 1.9
+        },
+        10,
     );
 
-    let result = SegmentationResult { condyle, fossa };
-    serde_json::to_string(&result).unwrap_or_else(|_| "{\"condyle\":[],\"fossa\":[]}".to_owned())
+    let result = SegmentationResult {
+        side: side.to_owned(),
+        condyle,
+        fossa,
+    };
+    serde_json::to_string(&result)
+        .unwrap_or_else(|_| "{\"side\":\"unknown\",\"condyle\":[],\"fossa\":[]}".to_owned())
 }
