@@ -1,14 +1,18 @@
 /* tslint:disable */
 /* eslint-disable */
 export function greet_wasm(): string;
+export function process_image_for_tmj(data: Uint8Array, width: number, height: number, side: string): string;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
   readonly memory: WebAssembly.Memory;
   readonly greet_wasm: () => [number, number];
+  readonly process_image_for_tmj: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number];
   readonly __wbindgen_export_0: WebAssembly.Table;
   readonly __wbindgen_free: (a: number, b: number, c: number) => void;
+  readonly __wbindgen_malloc: (a: number, b: number) => number;
+  readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
   readonly __wbindgen_start: () => void;
 }
 
