@@ -1,6 +1,7 @@
 use image::{GrayImage, Luma};
-use imageproc::contrast::otsu_level;
 use imageproc::contours::{find_contours_with_threshold, BorderType, Contour};
+use imageproc::contrast::otsu_level;
+use imageproc::edges::canny;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -20,7 +21,7 @@ struct SegmentationResult {
     fossa: Vec<[f64; 2]>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
 struct RoiBounds {
     x: u32,
     y: u32,
@@ -32,6 +33,8 @@ struct RoiBounds {
 struct Candidate {
     area: f64,
     centroid_x: f64,
+    centroid_y: f64,
+    bounds: RoiBounds,
     polyline: Vec<[f64; 2]>,
 }
 
@@ -89,7 +92,10 @@ fn polyline_from_contour(contour: &Contour<u32>) -> Vec<[f64; 2]> {
     for point in &contour.points {
         let current = [point.x as f64, point.y as f64];
         if last
-            .map(|prev| (prev[0] - current[0]).abs() < f64::EPSILON && (prev[1] - current[1]).abs() < f64::EPSILON)
+            .map(|prev| {
+                (prev[0] - current[0]).abs() < f64::EPSILON
+                    && (prev[1] - current[1]).abs() < f64::EPSILON
+            })
             .unwrap_or(false)
         {
             continue;
@@ -191,7 +197,10 @@ fn limit_points(points: Vec<[f64; 2]>, max_points: usize) -> Vec<[f64; 2]> {
 fn collect_candidates(contours: &[Contour<u32>]) -> Vec<Candidate> {
     let mut candidates = Vec::new();
 
-    for contour in contours.iter().filter(|c| c.border_type == BorderType::Outer) {
+    for contour in contours
+        .iter()
+        .filter(|c| c.border_type == BorderType::Outer)
+    {
         if let Some((min_x, min_y, max_x, max_y)) = contour_bounds(contour) {
             let width = max_x.saturating_sub(min_x).saturating_add(1);
             let height = max_y.saturating_sub(min_y).saturating_add(1);
@@ -202,6 +211,7 @@ fn collect_candidates(contours: &[Contour<u32>]) -> Vec<Candidate> {
             }
 
             let centroid_x = (min_x as f64 + max_x as f64) / 2.0;
+            let centroid_y = (min_y as f64 + max_y as f64) / 2.0;
             let mut polyline = polyline_from_contour(contour);
 
             if polyline.len() < 3 {
@@ -220,6 +230,13 @@ fn collect_candidates(contours: &[Contour<u32>]) -> Vec<Candidate> {
             candidates.push(Candidate {
                 area,
                 centroid_x,
+                centroid_y,
+                bounds: RoiBounds {
+                    x: min_x,
+                    y: min_y,
+                    width,
+                    height,
+                },
                 polyline,
             });
         }
@@ -230,6 +247,238 @@ fn collect_candidates(contours: &[Contour<u32>]) -> Vec<Candidate> {
         Vec::new()
     } else {
         candidates
+    }
+}
+
+fn select_condyle_candidate(
+    candidates: &[Candidate],
+    width: u32,
+    height: u32,
+) -> Option<Candidate> {
+    let min_width = (width as f64 * 0.04).max(24.0);
+    let min_height = (height as f64 * 0.04).max(24.0);
+    let max_width = (width as f64 * 0.75).max(min_width + 1.0);
+    let max_height = (height as f64 * 0.75).max(min_height + 1.0);
+
+    candidates
+        .iter()
+        .filter(|candidate| {
+            let bounds = candidate.bounds;
+            let w = bounds.width as f64;
+            let h = bounds.height as f64;
+            if w < min_width || h < min_height {
+                return false;
+            }
+            if w > max_width || h > max_height {
+                return false;
+            }
+            let aspect = if w < 1.0 || h < 1.0 {
+                f64::INFINITY
+            } else {
+                w.max(h) / w.min(h)
+            };
+            if aspect > 3.6 {
+                return false;
+            }
+            if candidate.centroid_y < height as f64 * 0.45 {
+                return false;
+            }
+            candidate.area > 800.0
+        })
+        .max_by(|a, b| {
+            a.area
+                .partial_cmp(&b.area)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .cloned()
+}
+
+fn select_fossa_candidate(
+    candidates: &[Candidate],
+    condyle_bounds: RoiBounds,
+    width: u32,
+    height: u32,
+) -> Option<Candidate> {
+    let condyle_center_x = condyle_bounds.x as f64 + condyle_bounds.width as f64 / 2.0;
+    let search_band = (condyle_bounds.width as f64 * 2.5).max(30.0);
+    let max_height = (condyle_bounds.height as f64 * 1.8).max(condyle_bounds.height as f64 + 1.0);
+    let min_height = (condyle_bounds.height as f64 * 0.25).max(12.0);
+    let min_width = (condyle_bounds.width as f64 * 0.6).max(24.0);
+    let max_width = (condyle_bounds.width as f64 * 4.0).min(width as f64 * 0.9);
+
+    candidates
+        .iter()
+        .filter(|candidate| {
+            let bounds = candidate.bounds;
+            if bounds.x == condyle_bounds.x
+                && bounds.y == condyle_bounds.y
+                && bounds.width == condyle_bounds.width
+                && bounds.height == condyle_bounds.height
+            {
+                return false;
+            }
+
+            if candidate.centroid_y >= condyle_bounds.y as f64 {
+                return false;
+            }
+
+            let w = bounds.width as f64;
+            let h = bounds.height as f64;
+            if w < min_width || w > max_width || h < min_height || h > max_height {
+                return false;
+            }
+            let aspect = if w < 1.0 || h < 1.0 {
+                f64::INFINITY
+            } else {
+                w.max(h) / w.min(h)
+            };
+            if aspect > 6.0 {
+                return false;
+            }
+
+            let center_x = candidate.centroid_x;
+            if (center_x - condyle_center_x).abs() > search_band {
+                return false;
+            }
+
+            candidate.area > 400.0
+                && bounds.y as f64 > (condyle_bounds.y as f64 - height as f64 * 0.4)
+        })
+        .max_by(|a, b| {
+            a.area
+                .partial_cmp(&b.area)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .cloned()
+}
+
+fn trace_fossa_curve(gray: &GrayImage, threshold: u8, condyle_bounds: RoiBounds) -> Vec<[f64; 2]> {
+    if condyle_bounds.y == 0 {
+        return Vec::new();
+    }
+
+    let width = gray.width();
+    let height = gray.height();
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let margin_x = ((condyle_bounds.width as f64) * 1.2).round().max(20.0) as i32;
+    let margin_y = ((condyle_bounds.height as f64) * 2.2).round().max(28.0) as i32;
+
+    let mut left = condyle_bounds.x as i32 - margin_x;
+    let mut right = (condyle_bounds.x + condyle_bounds.width) as i32 + margin_x;
+    let mut top = condyle_bounds.y as i32 - margin_y;
+    let bottom = condyle_bounds.y as i32;
+
+    left = left.max(0);
+    right = right.min(width as i32 - 1).max(left);
+    top = top.max(0).min(bottom - 1);
+
+    if top >= bottom {
+        return Vec::new();
+    }
+
+    let roi_width = (right - left + 1) as u32;
+    let roi_height = (bottom - top) as u32;
+    if roi_width < 2 || roi_height < 2 {
+        return Vec::new();
+    }
+
+    let mut roi_image = GrayImage::new(roi_width, roi_height);
+    for (local_y, global_y) in (top..bottom).enumerate() {
+        for (local_x, global_x) in (left..=right).enumerate() {
+            let pixel = gray.get_pixel(global_x as u32, global_y as u32);
+            roi_image.put_pixel(local_x as u32, local_y as u32, *pixel);
+        }
+    }
+
+    let high_threshold = ((threshold as f32) * 1.8).clamp(60.0, 360.0);
+    let low_threshold = (high_threshold * 0.4).max(18.0);
+    let edges = canny(&roi_image, low_threshold, high_threshold);
+
+    let horizontal_span = roi_width;
+    let step = ((horizontal_span / (MAX_POLYLINE_POINTS as u32 * 3)).max(1)) as usize;
+    let mut edge_points: Vec<[f64; 2]> = Vec::new();
+    for global_x in (left..=right).step_by(step) {
+        let local_x = (global_x - left) as u32;
+        let mut found: Option<u32> = None;
+        for local_y in (0..roi_height).rev() {
+            if edges.get_pixel(local_x, local_y)[0] > 0 {
+                found = Some(local_y);
+                break;
+            }
+        }
+        if let Some(local_y) = found {
+            edge_points.push([global_x as f64, (top + local_y as i32) as f64]);
+        }
+    }
+
+    if edge_points.len() >= 4 {
+        return smooth_and_limit(edge_points);
+    }
+
+    // Edge-based detection could not find a stable path; fall back to intensity-based sampling.
+    let step = ((horizontal_span / (MAX_POLYLINE_POINTS as u32 * 2)).max(1)) as usize;
+    let intensity_threshold = threshold.saturating_add(12);
+
+    let mut points: Vec<[f64; 2]> = Vec::new();
+    for global_x in (left..=right).step_by(step) {
+        let mut best_value = 0u8;
+        let mut best_y: Option<i32> = None;
+        let mut candidate_y: Option<i32> = None;
+        for y in (top..bottom).rev() {
+            let value = gray.get_pixel(global_x as u32, y as u32)[0];
+            if value >= intensity_threshold {
+                candidate_y = Some(y);
+                break;
+            }
+            if value > best_value {
+                best_value = value;
+                best_y = Some(y);
+            }
+        }
+
+        let selected_y =
+            candidate_y.or(best_y.filter(|_| best_value >= threshold.saturating_add(6)));
+
+        if let Some(y) = selected_y {
+            let point = [global_x as f64, y as f64];
+            if points
+                .last()
+                .map(|last| {
+                    (last[0] - point[0]).abs() > f64::EPSILON
+                        || (last[1] - point[1]).abs() > f64::EPSILON
+                })
+                .unwrap_or(true)
+            {
+                points.push(point);
+            }
+        }
+    }
+
+    if points.len() < 4 {
+        return Vec::new();
+    }
+
+    smooth_and_limit(points)
+}
+
+fn smooth_and_limit(points: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
+    if points.len() <= 2 {
+        return points;
+    }
+
+    let mut smoothed = points.clone();
+    for i in 1..smoothed.len() - 1 {
+        let avg_y = (points[i - 1][1] + points[i][1] + points[i + 1][1]) / 3.0;
+        smoothed[i][1] = avg_y;
+    }
+
+    if smoothed.len() > MAX_POLYLINE_POINTS {
+        limit_points(smoothed, MAX_POLYLINE_POINTS)
+    } else {
+        smoothed
     }
 }
 
@@ -288,7 +537,10 @@ pub fn detect_roi(data: Box<[u8]>, width: u32, height: u32) -> String {
     let mut best_bbox: Option<RoiBounds> = None;
     let mut best_area = 0f64;
 
-    for contour in contours.iter().filter(|c| c.border_type == BorderType::Outer) {
+    for contour in contours
+        .iter()
+        .filter(|c| c.border_type == BorderType::Outer)
+    {
         if let Some((min_x, min_y, max_x, max_y)) = contour_bounds(contour) {
             let width = max_x.saturating_sub(min_x).saturating_add(1);
             let height = max_y.saturating_sub(min_y).saturating_add(1);
@@ -399,39 +651,36 @@ pub fn process_image_for_tmj(data: Box<[u8]>, width: u32, height: u32, side: &st
     let threshold = otsu_level(&gray);
     let contours = find_contours_with_threshold::<u32>(&gray, threshold);
 
-    let mut candidates = collect_candidates(&contours);
-    if candidates.len() < 2 {
-        return fallback_segmentation(side, width, height);
-    }
-
-    candidates.sort_by(|a, b| b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal));
-    let mut primary: Vec<Candidate> = candidates.into_iter().take(8).collect();
-    if primary.len() < 2 {
-        return fallback_segmentation(side, width, height);
-    }
-
-    primary.sort_by(|a, b| a.centroid_x.partial_cmp(&b.centroid_x).unwrap_or(std::cmp::Ordering::Equal));
-
-    let is_left = matches!(side.to_ascii_lowercase().as_str(), "left" | "l");
-
-    let condyle_candidate = if is_left {
-        primary.first().cloned()
-    } else {
-        primary.last().cloned()
+    let candidates = collect_candidates(&contours);
+    let condyle_candidate = match select_condyle_candidate(&candidates, width, height) {
+        Some(candidate) => candidate,
+        None => return fallback_segmentation(side, width, height),
     };
 
-    let fossa_candidate = if is_left {
-        primary.last().cloned()
-    } else {
-        primary.first().cloned()
-    };
+    let mut condyle_points = condyle_candidate.polyline.clone();
+    if condyle_points.len() > MAX_POLYLINE_POINTS {
+        condyle_points = limit_points(condyle_points, MAX_POLYLINE_POINTS);
+    }
 
-    let (condyle_points, fossa_points) = match (condyle_candidate, fossa_candidate) {
-        (Some(condyle), Some(fossa)) if condyle.polyline.len() > 1 && fossa.polyline.len() > 1 => {
-            (condyle.polyline, fossa.polyline)
+    let mut fossa_points = if let Some(candidate) =
+        select_fossa_candidate(&candidates, condyle_candidate.bounds, width, height)
+    {
+        let mut points = candidate.polyline.clone();
+        if points.len() > MAX_POLYLINE_POINTS {
+            points = limit_points(points, MAX_POLYLINE_POINTS);
         }
-        _ => return fallback_segmentation(side, width, height),
+        points
+    } else {
+        Vec::new()
     };
+
+    if fossa_points.len() < 2 {
+        fossa_points = trace_fossa_curve(&gray, threshold, condyle_candidate.bounds);
+    }
+
+    if fossa_points.len() < 2 {
+        return fallback_segmentation(side, width, height);
+    }
 
     serde_json::to_string(&SegmentationResult {
         side: side.to_owned(),

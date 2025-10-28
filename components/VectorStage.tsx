@@ -27,6 +27,13 @@ export type ModifierState = {
   shift: boolean;
 };
 
+type Bounds = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
 type RegionStyle = {
   stroke: string;
   anchor: string;
@@ -54,6 +61,8 @@ type VectorStageProps = {
   regionStyles: Record<VectorRegion, RegionStyle>;
   calibration: CalibrationOverlay;
   fitViewRequest?: FitViewRequest | null;
+  roiOverlay?: Bounds | null;
+  onViewportChange?: (viewport: Bounds) => void;
   onSelectAnchor: (region: VectorRegion, index: number) => void;
   onAnchorDrag: (
     region: VectorRegion,
@@ -83,6 +92,8 @@ export default function VectorStage({
   regionStyles,
   calibration,
   fitViewRequest,
+  roiOverlay,
+  onViewportChange,
   onSelectAnchor,
   onAnchorDrag,
   onRequestAddAnchor,
@@ -90,11 +101,80 @@ export default function VectorStage({
   onBackgroundClick,
 }: VectorStageProps) {
   const stageRef = useRef<Konva.Stage>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const lastViewportRef = useRef<Bounds | null>(null);
   const [stageScale, setStageScale] = useState<number>(1);
   const [stagePosition, setStagePosition] = useState<{ x: number; y: number }>(
     { x: 0, y: 0 }
   );
   const [pointer, setPointer] = useState<{ x: number; y: number } | null>(null);
+
+  const computeViewport = useCallback(
+    (scaleValue: number, positionValue: { x: number; y: number }): Bounds | null => {
+      if (!dimensions || !containerRef.current || scaleValue <= 0) {
+        return null;
+      }
+      const container = containerRef.current;
+      const clientWidth = container.clientWidth || dimensions.width;
+      const clientHeight = container.clientHeight || dimensions.height;
+      const scrollLeft = container.scrollLeft;
+      const scrollTop = container.scrollTop;
+
+      const startX = clampValue(
+        (scrollLeft - positionValue.x) / scaleValue,
+        0,
+        dimensions.width
+      );
+      const startY = clampValue(
+        (scrollTop - positionValue.y) / scaleValue,
+        0,
+        dimensions.height
+      );
+      const endX = clampValue(
+        (scrollLeft + clientWidth - positionValue.x) / scaleValue,
+        0,
+        dimensions.width
+      );
+      const endY = clampValue(
+        (scrollTop + clientHeight - positionValue.y) / scaleValue,
+        0,
+        dimensions.height
+      );
+
+      return {
+        x: startX,
+        y: startY,
+        width: Math.max(0, endX - startX),
+        height: Math.max(0, endY - startY),
+      };
+    },
+    [dimensions]
+  );
+
+  const emitViewport = useCallback(
+    (scaleValue: number, positionValue: { x: number; y: number }) => {
+      if (!onViewportChange) {
+        return;
+      }
+      const viewport = computeViewport(scaleValue, positionValue);
+      if (!viewport) {
+        return;
+      }
+      const previous = lastViewportRef.current;
+      if (
+        previous &&
+        Math.abs(previous.x - viewport.x) < 0.5 &&
+        Math.abs(previous.y - viewport.y) < 0.5 &&
+        Math.abs(previous.width - viewport.width) < 0.5 &&
+        Math.abs(previous.height - viewport.height) < 0.5
+      ) {
+        return;
+      }
+      lastViewportRef.current = viewport;
+      onViewportChange(viewport);
+    },
+    [computeViewport, onViewportChange]
+  );
 
   useEffect(() => {
     setStageScale(1);
@@ -127,23 +207,48 @@ export default function VectorStage({
   }, [calibration.active]);
 
   useEffect(() => {
+    emitViewport(stageScale, stagePosition);
+  }, [emitViewport, stagePosition, stageScale]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) {
+      return;
+    }
+    const handleScroll = () => {
+      emitViewport(stageScale, stagePosition);
+    };
+    container.addEventListener('scroll', handleScroll, { passive: true });
+    return () => {
+      container.removeEventListener('scroll', handleScroll);
+    };
+  }, [emitViewport, stagePosition, stageScale]);
+
+  useEffect(() => {
     if (!fitViewRequest) {
       return;
     }
     const stage = stageRef.current;
-    setStageScale(fitViewRequest.scale);
-    setStagePosition(fitViewRequest.position);
+    const { scale, position } = fitViewRequest;
+    setStageScale(scale);
+    setStagePosition(position);
+    emitViewport(scale, position);
     if (stage) {
       stage.to({
         duration: 0.45,
         easing: Konva.Easings.EaseInOut,
-        scaleX: fitViewRequest.scale,
-        scaleY: fitViewRequest.scale,
-        x: fitViewRequest.position.x,
-        y: fitViewRequest.position.y,
+        scaleX: scale,
+        scaleY: scale,
+        x: position.x,
+        y: position.y,
+        onFinish: () => {
+          const currentScale = stage.scaleX();
+          const currentPosition = stage.position();
+          emitViewport(currentScale, currentPosition);
+        },
       });
     }
-  }, [fitViewRequest?.token]);
+  }, [emitViewport, fitViewRequest?.token]);
 
   const distanceToSegmentSquared = useCallback(
     (
@@ -272,8 +377,9 @@ export default function VectorStage({
 
       setStageScale(newScale);
       setStagePosition(newPosition);
+      emitViewport(newScale, newPosition);
     },
-    [inputState.ctrl, stagePosition.x, stagePosition.y, stageScale]
+    [emitViewport, inputState.ctrl, stagePosition.x, stagePosition.y, stageScale]
   );
 
   const handleStageDragEnd = useCallback(() => {
@@ -284,9 +390,11 @@ export default function VectorStage({
     if (!stage) {
       return;
     }
-    setStagePosition(stage.position());
+    const position = stage.position();
+    setStagePosition(position);
+    emitViewport(stage.scaleX(), position);
     updateCursor(inputState.space ? 'grab' : 'default');
-  }, [inputState.space, updateCursor]);
+  }, [emitViewport, inputState.space, updateCursor]);
 
   const handleStageDragStart = useCallback(() => {
     if (calibration.active || !inputState.space) {
@@ -340,6 +448,7 @@ export default function VectorStage({
 
   return (
     <div
+      ref={containerRef}
       className="vector-stage-container"
       style={{
         position: 'relative',
@@ -444,6 +553,20 @@ export default function VectorStage({
               width={dimensions.width}
               height={dimensions.height}
               opacity={0.9}
+            />
+          )}
+
+          {roiOverlay && (
+            <Rect
+              x={roiOverlay.x}
+              y={roiOverlay.y}
+              width={roiOverlay.width}
+              height={roiOverlay.height}
+              stroke="rgba(239, 68, 68, 0.45)"
+              strokeWidth={2}
+              dash={[12, 8]}
+              fillEnabled={false}
+              listening={false}
             />
           )}
 

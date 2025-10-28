@@ -66,6 +66,7 @@ type FitViewRequest = {
   scale: number;
   position: { x: number; y: number };
   token: number;
+  roi?: RoiBounds | null;
 };
 
 type CalibrationState = {
@@ -87,6 +88,8 @@ type SideState = {
   mmPerPixel: number | null;
   calibration: CalibrationState;
   fitViewRequest: FitViewRequest | null;
+  lastRoi: RoiBounds | null;
+  viewport: RoiBounds | null;
 };
 
 const createInitialSideState = (): SideState => ({
@@ -101,7 +104,13 @@ const createInitialSideState = (): SideState => ({
   mmPerPixel: null,
   calibration: { active: false, points: [], pendingPixels: null, inputValue: '' },
   fitViewRequest: null,
+  lastRoi: null,
+  viewport: null,
 });
+
+const AUTO_ZOOM_COVERAGE = 0.45;
+const AUTO_ZOOM_BOOST = 1.45;
+const AUTO_ZOOM_MAX_SCALE = 6.0;
 
 const computeFitView = (
   dimensions: { width: number; height: number },
@@ -116,7 +125,7 @@ const computeFitView = (
     return null;
   }
 
-  const desiredCoverage = 0.8;
+  const desiredCoverage = AUTO_ZOOM_COVERAGE;
   const scaleX = (dimensions.width * desiredCoverage) / roi.width;
   const scaleY = (dimensions.height * desiredCoverage) / roi.height;
   let scale = Math.min(scaleX, scaleY);
@@ -125,6 +134,8 @@ const computeFitView = (
   } else if (scale < 1) {
     scale = 1;
   }
+
+  scale = clamp(scale * AUTO_ZOOM_BOOST, 1.0, AUTO_ZOOM_MAX_SCALE);
 
   const centerX = (roi.x as number) + (roi.width as number) / 2;
   const centerY = (roi.y as number) + (roi.height as number) / 2;
@@ -140,6 +151,39 @@ const computeFitView = (
 
 const clamp = (value: number, min: number, max: number) =>
   Math.min(Math.max(value, min), max);
+
+const maskGrayscale = (
+  source: Uint8Array,
+  width: number,
+  height: number,
+  viewport: RoiBounds
+) => {
+  const masked = new Uint8Array(source);
+
+  const startX = clamp(Math.floor(viewport.x), 0, width);
+  const endX = clamp(Math.ceil(viewport.x + viewport.width), 0, width);
+  const startY = clamp(Math.floor(viewport.y), 0, height);
+  const endY = clamp(Math.ceil(viewport.y + viewport.height), 0, height);
+
+  for (let y = 0; y < height; y += 1) {
+    const rowStart = y * width;
+    const rowEnd = rowStart + width;
+
+    if (y < startY || y >= endY) {
+      masked.fill(0, rowStart, rowEnd);
+      continue;
+    }
+
+    if (startX > 0) {
+      masked.fill(0, rowStart, rowStart + startX);
+    }
+    if (endX < width) {
+      masked.fill(0, rowStart + endX, rowEnd);
+    }
+  }
+
+  return masked;
+};
 
 const distanceToSegmentSquared = (
   px: number,
@@ -255,6 +299,60 @@ const buildVectorJson = (side: Side, vectorData: VectorShape) =>
     2
   );
 
+const computeVectorBounds = (
+  vectorData: VectorShape,
+  imageSize?: { width: number; height: number },
+  padding = 24
+): RoiBounds | null => {
+  const allPoints = [
+    ...(vectorData.condyle ?? []),
+    ...(vectorData.fossa ?? []),
+  ];
+  if (allPoints.length === 0) {
+    return null;
+  }
+
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+
+  for (const [x, y] of allPoints) {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      continue;
+    }
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+  }
+
+  if (
+    !Number.isFinite(minX) ||
+    !Number.isFinite(minY) ||
+    !Number.isFinite(maxX) ||
+    !Number.isFinite(maxY)
+  ) {
+    return null;
+  }
+
+  const limits = imageSize ?? { width: Number.POSITIVE_INFINITY, height: Number.POSITIVE_INFINITY };
+  const paddedMinX = clamp(Math.floor(minX - padding), 0, limits.width);
+  const paddedMinY = clamp(Math.floor(minY - padding), 0, limits.height);
+  const paddedMaxX = clamp(Math.ceil(maxX + padding), 0, limits.width);
+  const paddedMaxY = clamp(Math.ceil(maxY + padding), 0, limits.height);
+
+  const width = Math.max(1, paddedMaxX - paddedMinX);
+  const height = Math.max(1, paddedMaxY - paddedMinY);
+
+  return {
+    x: paddedMinX,
+    y: paddedMinY,
+    width,
+    height,
+  };
+};
+
 export default function Home() {
   const [sideStates, setSideStates] = useState<Record<Side, SideState>>({
     left: createInitialSideState(),
@@ -348,7 +446,35 @@ export default function Home() {
         const module = await loadWasm();
         const { width, height } = state.dimensions;
         const grayscale = extractGrayscale(state.imageNode, width, height);
-        const raw = module.process_image_for_tmj(grayscale, width, height, side);
+        const viewport = state.viewport;
+        const masked = viewport
+          ? maskGrayscale(grayscale, width, height, viewport)
+          : grayscale;
+        let roi: RoiBounds | null = null;
+        if (typeof module.detect_roi === 'function') {
+          try {
+            const rawRoi = module.detect_roi(masked, width, height);
+            const parsed = JSON.parse(rawRoi) as Partial<RoiBounds>;
+            if (
+              typeof parsed.x === 'number' &&
+              typeof parsed.y === 'number' &&
+              typeof parsed.width === 'number' &&
+              typeof parsed.height === 'number' &&
+              parsed.width > 0 &&
+              parsed.height > 0
+            ) {
+              roi = {
+                x: parsed.x,
+                y: parsed.y,
+                width: parsed.width,
+                height: parsed.height,
+              };
+            }
+          } catch (error) {
+            console.warn('Failed to parse ROI result', error);
+          }
+        }
+        const raw = module.process_image_for_tmj(masked, width, height, side);
         const parsed = JSON.parse(raw) as {
           condyle?: Array<[number, number]>;
           fossa?: Array<[number, number]>;
@@ -358,6 +484,10 @@ export default function Home() {
           fossa: parsed.fossa ?? [],
         };
         const constrained = ensureMaxPoints(normalized, MAX_POINTS);
+        const dimensions = state.dimensions;
+        const vectorBounds = dimensions
+          ? computeVectorBounds(constrained, dimensions)
+          : computeVectorBounds(constrained);
 
         updateSideState(side, (prev) => ({
           ...prev,
@@ -369,6 +499,26 @@ export default function Home() {
             reason === 'auto'
               ? '自動抽出完了。必要に応じて調整してください。'
               : '自動抽出完了。必要に応じて調整してください。',
+          ...(vectorBounds || roi
+            ? (() => {
+                const availableRoi = vectorBounds ?? roi!;
+                const dims = prev.dimensions ?? state.dimensions;
+                const fit = dims ? computeFitView(dims, availableRoi) : null;
+                return {
+                  lastRoi: availableRoi,
+                  ...(fit
+                    ? {
+                        fitViewRequest: {
+                          scale: fit.scale,
+                          position: fit.position,
+                          token: Date.now(),
+                          roi: availableRoi,
+                        },
+                      }
+                    : {}),
+                };
+              })()
+            : { lastRoi: prev.lastRoi }),
         }));
       } catch (error) {
         console.error('Segmentation failed', error);
@@ -407,10 +557,13 @@ export default function Home() {
             pendingPixels: null,
             inputValue: '',
           },
-          fitViewRequest: {
-            scale: 1,
-            position: { x: 0, y: 0 },
-            token: Date.now(),
+          fitViewRequest: null,
+          lastRoi: null,
+          viewport: {
+            x: 0,
+            y: 0,
+            width: dimensions.width,
+            height: dimensions.height,
           },
           status: 'ready',
           statusMessage: '画像読み込み済み。処理を準備しています...',
@@ -466,7 +619,9 @@ export default function Home() {
                   scale: fit.scale,
                   position: fit.position,
                   token,
+                  roi,
                 },
+                lastRoi: roi,
                 statusMessage: 'ROIを検出しました。ビューを調整しています...',
               }));
               window.setTimeout(() => {
@@ -475,12 +630,14 @@ export default function Home() {
             } else {
               updateSideState(side, (prev) => ({
                 ...prev,
+                lastRoi: null,
                 statusMessage: '画像読み込み済み。自動抽出を実行してください。',
               }));
             }
           } else {
             updateSideState(side, (prev) => ({
               ...prev,
+              lastRoi: null,
               statusMessage:
                 '画像読み込み済み。自動抽出を実行してください。',
             }));
@@ -688,6 +845,24 @@ export default function Home() {
       });
     },
     [updateSideState]
+  );
+
+  const handleViewportChange = useCallback(
+    (side: Side, viewport: RoiBounds) => {
+      updateSideState(side, (prev) => ({
+        ...prev,
+        viewport,
+      }));
+    },
+    [updateSideState]
+  );
+
+  const viewportHandlers = useMemo(
+    () => ({
+      left: (viewport: RoiBounds) => handleViewportChange('left', viewport),
+      right: (viewport: RoiBounds) => handleViewportChange('right', viewport),
+    }),
+    [handleViewportChange]
   );
 
   const handleConfirmCalibration = useCallback(
@@ -1310,6 +1485,10 @@ export default function Home() {
                     regionStyles={REGION_STYLES}
                     calibration={state.calibration}
                     fitViewRequest={state.fitViewRequest}
+                    roiOverlay={
+                      process.env.NODE_ENV !== 'production' ? state.lastRoi : null
+                    }
+                    onViewportChange={viewportHandlers[side]}
                     onCalibrationPoint={(point) =>
                       handleCalibrationPoint(side, point)
                     }
